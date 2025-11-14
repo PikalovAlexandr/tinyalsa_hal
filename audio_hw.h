@@ -232,10 +232,15 @@ struct pcm_config pcm_config_direct = {
     .format = PCM_FORMAT_S16_LE,
 };
 
+#define SIMCOM_MODEM_RATE            8000
+#define SIMCOM_MODEM_CHANNELS        1
+#define SIMCOM_MODEM_PERIOD_SAMPLES  320
+#define SIMCOM_MODEM_PERIOD_BYTES    (SIMCOM_MODEM_PERIOD_SAMPLES * sizeof(int16_t))
+
 struct pcm_config pcm_config_simcom = {
-    .channels = 1,
-    .rate = 8000,
-    .period_size = 320,     /* 640 bytes = 320 samples at 16-bit mono */
+    .channels = SIMCOM_MODEM_CHANNELS,
+    .rate = SIMCOM_MODEM_RATE,
+    .period_size = SIMCOM_MODEM_PERIOD_SAMPLES,     /* 640 bytes = 320 samples at 16-bit mono */
     .period_count = 4,
     .format = PCM_FORMAT_S16_LE,
 };
@@ -387,11 +392,30 @@ struct audio_device {
     bool simcom_mixer_configured;
     int simcom_mixer_card;
     bool simcom_cpcmreg_state;
+    struct pcm *simcom_modem_pcm;
+    struct pcm *simcom_downlink_pcm;
+    struct pcm *simcom_speaker_pcm;
+    bool simcom_direct_mode_enabled;
+    bool simcom_direct_path_ready;
+    bool simcom_capture_direct_8k;
+    bool simcom_downlink_thread_started;
+    bool simcom_downlink_thread_stop;
+    pthread_t simcom_downlink_thread;
+    bool simcom_speaker_needs_resample;
+    uint32_t simcom_speaker_rate;
+    uint32_t simcom_speaker_channels;
+    double simcom_downlink_resample_pos;
+    int16_t *simcom_downlink_resample_buf;
+    size_t simcom_downlink_resample_capacity;
+    size_t simcom_uplink_accum_used;
+    int16_t simcom_uplink_accum[SIMCOM_MODEM_PERIOD_SAMPLES];
     struct simcom_capture_stats simcom_stats;
     uint32_t simcom_capture_batches;
     uint32_t simcom_capture_zero_batches;
     uint32_t simcom_capture_nonzero_batches;
     uint32_t simcom_capture_consecutive_zero;
+    uint32_t simcom_silence_recoveries;
+    uint64_t simcom_last_silence_recover_ms;
 };
 
 struct stream_out {

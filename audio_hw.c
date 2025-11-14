@@ -63,6 +63,8 @@
 
 #define SIMCOM_MIC_RING_CAPACITY_SAMPLES (8000 * 6) // ~6 seconds of uplink audio
 #define SIMCOM_TTY_DEVICE "/dev/ttyUSB3"
+#define SIMCOM_SILENCE_RECOVERY_THRESHOLD 1000
+#define SIMCOM_SILENCE_RECOVERY_COOLDOWN_MS 3000
 
 static void simcom_ring_reset(struct audio_device *adev);
 static void simcom_ring_push(struct audio_device *adev, const int16_t *src, size_t samples);
@@ -74,6 +76,18 @@ static void simcom_voice_process_and_push(struct audio_device *adev,
         int16_t **mono_buf, size_t *mono_capacity,
         int16_t **downsample_buf, size_t *downsample_capacity,
         double *resample_pos, uint32_t *last_rate, uint32_t *last_channels);
+static void *simcom_downlink_thread(void *context);
+static int simcom_open_modem_pcm(struct audio_device *adev);
+static void simcom_close_modem_pcm(struct audio_device *adev);
+static void simcom_reset_uplink_accumulator(struct audio_device *adev);
+static void simcom_voice_write_to_modem(struct audio_device *adev,
+        const int16_t *samples, size_t frames);
+static int simcom_open_downlink_pcm(struct audio_device *adev);
+static void simcom_close_downlink_pcm(struct audio_device *adev);
+static int simcom_open_speaker_pcm(struct audio_device *adev);
+static void simcom_close_speaker_pcm(struct audio_device *adev);
+static size_t simcom_prepare_downlink_payload(struct audio_device *adev,
+        const int16_t *src, size_t frames, int16_t **dst);
 static int simcom_voice_start_capture(struct audio_device *adev);
 static void simcom_voice_stop_capture(struct audio_device *adev);
 static void *simcom_voice_capture_thread(void *context);
@@ -149,6 +163,448 @@ static bool simcom_debug_audio_enabled(void)
         initialized = 1;
     }
     return enabled;
+}
+
+static void simcom_configure_mic_controls(struct audio_device *adev, int mic_card);
+static void simcom_verify_mic_controls(int mic_card);
+
+static uint64_t simcom_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static void simcom_refresh_capture_route(struct audio_device *adev, const char *reason)
+{
+    if (!adev) {
+        return;
+    }
+    if (!adev->simcom_voice_active) {
+        return;
+    }
+
+    uint64_t now = simcom_now_ms();
+    if (adev->simcom_last_silence_recover_ms != 0 &&
+        (now - adev->simcom_last_silence_recover_ms) < SIMCOM_SILENCE_RECOVERY_COOLDOWN_MS) {
+        if (simcom_debug_audio_enabled()) {
+            ALOGE("SIMCOM voice: skip mic refresh (%s), cooldown %llums remain",
+                  reason ? reason : "unknown",
+                  (unsigned long long)(SIMCOM_SILENCE_RECOVERY_COOLDOWN_MS -
+                                       (now - adev->simcom_last_silence_recover_ms)));
+        }
+        return;
+    }
+
+    adev->simcom_last_silence_recover_ms = now;
+    adev->simcom_silence_recoveries++;
+
+    int mic_card = adev->dev_in[SND_IN_SOUND_CARD_MIC].card;
+    if (mic_card == (int)SND_IN_SOUND_CARD_UNKNOWN) {
+        mic_card = 2; // Fallback to RT5651
+    }
+
+    ALOGE("SIMCOM voice: refreshing mic route #%u (card=%d) reason=%s",
+          adev->simcom_silence_recoveries,
+          mic_card,
+          reason ? reason : "unknown");
+
+    route_pcm_close(CAPTURE_OFF_ROUTE);
+    adev->simcom_mic_route_active = false;
+    route_pcm_card_open(mic_card, MAIN_MIC_CAPTURE_ROUTE);
+    adev->simcom_mic_route_active = true;
+
+    // Force mixer reconfiguration
+    adev->simcom_mixer_configured = false;
+    simcom_configure_mic_controls(adev, mic_card);
+    simcom_verify_mic_controls(mic_card);
+    (void)simcom_update_cpcmreg(adev, true);
+}
+
+static void simcom_reset_uplink_accumulator(struct audio_device *adev)
+{
+    if (!adev) {
+        return;
+    }
+    adev->simcom_uplink_accum_used = 0;
+    memset(adev->simcom_uplink_accum, 0, sizeof(adev->simcom_uplink_accum));
+}
+
+static int simcom_open_modem_pcm(struct audio_device *adev)
+{
+    if (!adev) {
+        return -EINVAL;
+    }
+    if (adev->simcom_modem_pcm) {
+        return 0;
+    }
+
+    int card = adev->dev_out[SND_OUT_SOUND_CARD_BT].card;
+    int device = adev->dev_out[SND_OUT_SOUND_CARD_BT].device;
+    if (card == (int)SND_OUT_SOUND_CARD_UNKNOWN) {
+        ALOGE("SIMCOM voice: BT/SIMCOM sound card unknown, cannot open modem PCM");
+        return -ENODEV;
+    }
+    if (device == (int)SND_OUT_SOUND_CARD_UNKNOWN) {
+        device = 0;
+    }
+
+    struct pcm *pcm = pcm_open(card, device, PCM_OUT | PCM_MONOTONIC, &pcm_config_simcom);
+    if (!pcm) {
+        ALOGE("SIMCOM voice: pcm_open(modem) failed (card=%d device=%d)", card, device);
+        return -errno;
+    }
+    if (!pcm_is_ready(pcm)) {
+        ALOGE("SIMCOM voice: modem PCM not ready: %s", pcm_get_error(pcm));
+        pcm_close(pcm);
+        return -EIO;
+    }
+    if (pcm_prepare(pcm) != 0) {
+        ALOGE("SIMCOM voice: modem pcm_prepare failed: %s", pcm_get_error(pcm));
+        pcm_close(pcm);
+        return -EIO;
+    }
+
+    adev->simcom_modem_pcm = pcm;
+    adev->simcom_direct_path_ready = true;
+    simcom_reset_uplink_accumulator(adev);
+    ALOGE("SIMCOM voice: modem PCM opened (card=%d device=%d)", card, device);
+    return 0;
+}
+
+static void simcom_close_modem_pcm(struct audio_device *adev)
+{
+    if (!adev) {
+        return;
+    }
+    if (adev->simcom_modem_pcm) {
+        pcm_stop(adev->simcom_modem_pcm);
+        pcm_close(adev->simcom_modem_pcm);
+        adev->simcom_modem_pcm = NULL;
+    }
+    adev->simcom_direct_path_ready = false;
+    simcom_reset_uplink_accumulator(adev);
+}
+
+static void simcom_voice_write_to_modem(struct audio_device *adev,
+        const int16_t *samples, size_t frames)
+{
+    if (!adev || !samples || frames == 0) {
+        return;
+    }
+    if (!adev->simcom_direct_mode_enabled) {
+        return;
+    }
+    if (!adev->simcom_direct_path_ready) {
+        if (simcom_open_modem_pcm(adev) != 0) {
+            ALOGE("SIMCOM voice: unable to open modem PCM for direct uplink, falling back to buffer");
+            adev->simcom_direct_path_ready = false;
+            return;
+        }
+    }
+    if (!adev->simcom_modem_pcm) {
+        ALOGE("SIMCOM voice: modem PCM handle missing despite ready flag");
+        adev->simcom_direct_path_ready = false;
+        return;
+    }
+
+    while (frames > 0 && adev->simcom_direct_path_ready) {
+        size_t remaining = SIMCOM_MODEM_PERIOD_SAMPLES - adev->simcom_uplink_accum_used;
+        size_t copy = (frames < remaining) ? frames : remaining;
+        memcpy(adev->simcom_uplink_accum + adev->simcom_uplink_accum_used,
+               samples,
+               copy * sizeof(int16_t));
+        adev->simcom_uplink_accum_used += copy;
+        samples += copy;
+        frames -= copy;
+
+        if (adev->simcom_uplink_accum_used == SIMCOM_MODEM_PERIOD_SAMPLES) {
+            int ret = pcm_write(adev->simcom_modem_pcm,
+                                adev->simcom_uplink_accum,
+                                SIMCOM_MODEM_PERIOD_BYTES);
+            if (ret != 0) {
+                ALOGE("SIMCOM voice: pcm_write(modem) failed: %s (ret=%d)",
+                      pcm_get_error(adev->simcom_modem_pcm), ret);
+                if (pcm_prepare(adev->simcom_modem_pcm) != 0) {
+                    ALOGE("SIMCOM voice: pcm_prepare(modem) recovery failed: %s",
+                          pcm_get_error(adev->simcom_modem_pcm));
+                    simcom_close_modem_pcm(adev);
+                    break;
+                }
+            } else {
+                adev->simcom_uplink_accum_used = 0;
+            }
+        }
+    }
+}
+
+static int simcom_open_downlink_pcm(struct audio_device *adev)
+{
+    if (!adev) {
+        return -EINVAL;
+    }
+    if (adev->simcom_downlink_pcm) {
+        return 0;
+    }
+
+    int card = adev->dev_out[SND_OUT_SOUND_CARD_BT].card;
+    int device = adev->dev_out[SND_OUT_SOUND_CARD_BT].device;
+    if (card == (int)SND_OUT_SOUND_CARD_UNKNOWN) {
+        ALOGE("SIMCOM downlink: BT/SIMCOM sound card unknown");
+        return -ENODEV;
+    }
+    if (device == (int)SND_OUT_SOUND_CARD_UNKNOWN) {
+        device = 0;
+    }
+
+    struct pcm *pcm = pcm_open(card, device, PCM_IN | PCM_MONOTONIC, &pcm_config_simcom);
+    if (!pcm) {
+        ALOGE("SIMCOM downlink: pcm_open failed (card=%d device=%d)", card, device);
+        return -errno;
+    }
+    if (!pcm_is_ready(pcm)) {
+        ALOGE("SIMCOM downlink: modem PCM not ready: %s", pcm_get_error(pcm));
+        pcm_close(pcm);
+        return -EIO;
+    }
+    if (pcm_prepare(pcm) != 0) {
+        ALOGE("SIMCOM downlink: pcm_prepare failed: %s", pcm_get_error(pcm));
+        pcm_close(pcm);
+        return -EIO;
+    }
+
+    adev->simcom_downlink_pcm = pcm;
+    ALOGE("SIMCOM downlink: modem PCM opened (card=%d device=%d)", card, device);
+    return 0;
+}
+
+static void simcom_close_downlink_pcm(struct audio_device *adev)
+{
+    if (!adev) {
+        return;
+    }
+    if (adev->simcom_downlink_pcm) {
+        pcm_close(adev->simcom_downlink_pcm);
+        adev->simcom_downlink_pcm = NULL;
+    }
+}
+
+static int simcom_open_speaker_pcm(struct audio_device *adev)
+{
+    if (!adev) {
+        return -EINVAL;
+    }
+    if (adev->simcom_speaker_pcm) {
+        return 0;
+    }
+
+    int card = adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].card;
+    int device = adev->dev_out[SND_OUT_SOUND_CARD_SPEAKER].device;
+    if (card == (int)SND_OUT_SOUND_CARD_UNKNOWN) {
+        ALOGE("SIMCOM downlink: speaker sound card unknown");
+        return -ENODEV;
+    }
+    if (device == (int)SND_OUT_SOUND_CARD_UNKNOWN) {
+        device = 0;
+    }
+
+    adev->simcom_speaker_needs_resample = false;
+    adev->simcom_speaker_rate = SIMCOM_MODEM_RATE;
+    adev->simcom_speaker_channels = SIMCOM_MODEM_CHANNELS;
+    adev->simcom_downlink_resample_pos = 0.0;
+
+    struct pcm_config spk_cfg = pcm_config_simcom;
+    struct pcm *pcm = pcm_open(card, device, PCM_OUT | PCM_MONOTONIC, &spk_cfg);
+    if (pcm && pcm_is_ready(pcm)) {
+        if (pcm_prepare(pcm) != 0) {
+            ALOGE("SIMCOM downlink: speaker pcm_prepare failed: %s", pcm_get_error(pcm));
+            pcm_close(pcm);
+            pcm = NULL;
+        }
+    } else if (pcm) {
+        ALOGE("SIMCOM downlink: speaker pcm_open failed: %s", pcm_get_error(pcm));
+        pcm_close(pcm);
+        pcm = NULL;
+    }
+
+    if (!pcm) {
+        struct pcm_config fallback_cfg = pcm_config;
+        fallback_cfg.channels = (fallback_cfg.channels == 0) ? 2 : fallback_cfg.channels;
+        fallback_cfg.rate = (fallback_cfg.rate == 0) ? 48000 : fallback_cfg.rate;
+        fallback_cfg.period_size = (fallback_cfg.period_size == 0) ? 256 : fallback_cfg.period_size;
+
+        pcm = pcm_open(card, device, PCM_OUT | PCM_MONOTONIC, &fallback_cfg);
+        if (!pcm) {
+            ALOGE("SIMCOM downlink: fallback speaker open failed (card=%d device=%d)", card, device);
+            return -EIO;
+        }
+        if (!pcm_is_ready(pcm)) {
+            ALOGE("SIMCOM downlink: fallback speaker not ready: %s", pcm_get_error(pcm));
+            pcm_close(pcm);
+            return -EIO;
+        }
+        if (pcm_prepare(pcm) != 0) {
+            ALOGE("SIMCOM downlink: fallback speaker prepare failed: %s", pcm_get_error(pcm));
+            pcm_close(pcm);
+            return -EIO;
+        }
+
+        adev->simcom_speaker_needs_resample = true;
+        adev->simcom_speaker_rate = fallback_cfg.rate;
+        adev->simcom_speaker_channels = fallback_cfg.channels;
+    }
+
+    adev->simcom_speaker_pcm = pcm;
+    ALOGE("SIMCOM downlink: speaker PCM opened (card=%d device=%d rate=%u ch=%u resample=%d)",
+          card, device, adev->simcom_speaker_rate, adev->simcom_speaker_channels,
+          adev->simcom_speaker_needs_resample ? 1 : 0);
+    return 0;
+}
+
+static void simcom_close_speaker_pcm(struct audio_device *adev)
+{
+    if (!adev) {
+        return;
+    }
+    if (adev->simcom_speaker_pcm) {
+        pcm_close(adev->simcom_speaker_pcm);
+        adev->simcom_speaker_pcm = NULL;
+    }
+    adev->simcom_speaker_needs_resample = false;
+    adev->simcom_speaker_rate = SIMCOM_MODEM_RATE;
+    adev->simcom_speaker_channels = SIMCOM_MODEM_CHANNELS;
+    adev->simcom_downlink_resample_pos = 0.0;
+    free(adev->simcom_downlink_resample_buf);
+    adev->simcom_downlink_resample_buf = NULL;
+    adev->simcom_downlink_resample_capacity = 0;
+}
+
+static size_t simcom_prepare_downlink_payload(struct audio_device *adev,
+        const int16_t *src, size_t frames, int16_t **dst)
+{
+    if (!adev || !dst) {
+        return 0;
+    }
+
+    if (!adev->simcom_speaker_needs_resample &&
+        adev->simcom_speaker_channels == SIMCOM_MODEM_CHANNELS) {
+        *dst = (int16_t *)src;
+        return frames;
+    }
+
+    uint32_t speaker_rate = (adev->simcom_speaker_rate > 0) ? adev->simcom_speaker_rate : SIMCOM_MODEM_RATE;
+    uint32_t speaker_channels = (adev->simcom_speaker_channels > 0) ? adev->simcom_speaker_channels : SIMCOM_MODEM_CHANNELS;
+
+    size_t converted_frames = frames;
+    if (adev->simcom_speaker_needs_resample) {
+        converted_frames = (frames * speaker_rate + SIMCOM_MODEM_RATE - 1) / SIMCOM_MODEM_RATE + 8;
+    }
+
+    size_t required_samples = converted_frames * speaker_channels;
+    if (adev->simcom_downlink_resample_capacity < required_samples) {
+        size_t new_capacity = (adev->simcom_downlink_resample_capacity == 0) ? required_samples : adev->simcom_downlink_resample_capacity;
+        while (new_capacity < required_samples) {
+            new_capacity *= 2;
+        }
+        int16_t *tmp = realloc(adev->simcom_downlink_resample_buf, new_capacity * sizeof(int16_t));
+        if (!tmp) {
+            ALOGE("SIMCOM downlink: failed to allocate resample buffer (%zu samples)", required_samples);
+            return 0;
+        }
+        adev->simcom_downlink_resample_buf = tmp;
+        adev->simcom_downlink_resample_capacity = new_capacity;
+    }
+
+    int16_t *buffer = adev->simcom_downlink_resample_buf;
+    size_t mono_frames = frames;
+
+    if (adev->simcom_speaker_needs_resample) {
+        const double step = (double)SIMCOM_MODEM_RATE / (double)speaker_rate;
+        double pos = adev->simcom_downlink_resample_pos;
+        size_t out_count = 0;
+        while (out_count < converted_frames) {
+            size_t idx = (size_t)pos;
+            if (idx >= frames) {
+                break;
+            }
+            double frac = pos - (double)idx;
+            int32_t sample0 = src[idx];
+            int32_t sample1 = (idx + 1 < frames) ? src[idx + 1] : sample0;
+            int32_t interpolated = sample0 + (int32_t)((sample1 - sample0) * frac);
+            buffer[out_count++] = (int16_t)interpolated;
+            pos += step;
+        }
+        if (pos >= frames) {
+            pos -= frames;
+        }
+        adev->simcom_downlink_resample_pos = pos;
+        mono_frames = out_count;
+    } else {
+        memcpy(buffer, src, frames * sizeof(int16_t));
+        mono_frames = frames;
+    }
+
+    if (speaker_channels == 2) {
+        for (ssize_t idx = (ssize_t)mono_frames - 1; idx >= 0; --idx) {
+            int16_t sample = buffer[idx];
+            buffer[idx * 2] = sample;
+            buffer[idx * 2 + 1] = sample;
+        }
+    }
+
+    *dst = buffer;
+    return mono_frames;
+}
+
+static void *simcom_downlink_thread(void *context)
+{
+    struct audio_device *adev = (struct audio_device *)context;
+    if (!adev) {
+        return NULL;
+    }
+
+    const size_t modem_bytes = SIMCOM_MODEM_PERIOD_BYTES;
+    int16_t *modem_buffer = (int16_t *)malloc(modem_bytes);
+    if (!modem_buffer) {
+        ALOGE("SIMCOM downlink: failed to allocate modem buffer");
+        return NULL;
+    }
+
+    while (!adev->simcom_downlink_thread_stop &&
+           adev->simcom_voice_active &&
+           adev->simcom_downlink_pcm &&
+           adev->simcom_speaker_pcm) {
+        int ret = pcm_read(adev->simcom_downlink_pcm, modem_buffer, modem_bytes);
+        if (ret != 0) {
+            ALOGE("SIMCOM downlink: pcm_read failed: %s", pcm_get_error(adev->simcom_downlink_pcm));
+            usleep(5000);
+            continue;
+        }
+
+        int16_t *speaker_samples = modem_buffer;
+        size_t speaker_frames = SIMCOM_MODEM_PERIOD_SAMPLES;
+        if (adev->simcom_speaker_needs_resample ||
+            adev->simcom_speaker_channels != SIMCOM_MODEM_CHANNELS) {
+            speaker_frames = simcom_prepare_downlink_payload(adev, modem_buffer, SIMCOM_MODEM_PERIOD_SAMPLES, &speaker_samples);
+            if (speaker_frames == 0) {
+                continue;
+            }
+        }
+
+        size_t bytes_to_write = speaker_frames * adev->simcom_speaker_channels * sizeof(int16_t);
+        ret = pcm_write(adev->simcom_speaker_pcm, speaker_samples, bytes_to_write);
+        if (ret != 0) {
+            ALOGE("SIMCOM downlink: pcm_write failed: %s", pcm_get_error(adev->simcom_speaker_pcm));
+            if (pcm_prepare(adev->simcom_speaker_pcm) != 0) {
+                ALOGE("SIMCOM downlink: speaker pcm_prepare recovery failed: %s",
+                      pcm_get_error(adev->simcom_speaker_pcm));
+                break;
+            }
+        }
+    }
+
+    free(modem_buffer);
+    return NULL;
 }
 
 struct simcom_mixer_setting {
@@ -339,6 +795,10 @@ static void simcom_trace_capture_preview(struct audio_device *adev,
     if (all_zero) {
         st->zero_batches++;
         st->consecutive_zero++;
+        if (st->consecutive_zero >= SIMCOM_SILENCE_RECOVERY_THRESHOLD) {
+            simcom_refresh_capture_route(adev, "consecutive silence");
+            st->consecutive_zero = 0;
+        }
     } else {
         st->nonzero_batches++;
         st->consecutive_zero = 0;
@@ -712,7 +1172,13 @@ static void simcom_voice_process_and_push(struct audio_device *adev,
         push_frames = 0;
     }
 
-    if (push_frames > 0 && simcom_voice_ensure_ring(adev) == 0) {
+    bool direct_path_consumed = false;
+    if (push_frames > 0 && adev->simcom_direct_mode_enabled) {
+        simcom_voice_write_to_modem(adev, push_samples, push_frames);
+        direct_path_consumed = adev->simcom_direct_path_ready;
+    }
+
+    if (!direct_path_consumed && push_frames > 0 && simcom_voice_ensure_ring(adev) == 0) {
         simcom_ring_push(adev, push_samples, push_frames);
         if (simcom_debug_audio_enabled()) {
             int64_t sum_abs = 0;
@@ -970,14 +1436,15 @@ static int simcom_voice_start_capture(struct audio_device *adev)
     simcom_configure_mic_controls(adev, mic_card);
     simcom_verify_mic_controls(mic_card);
 
-    // Исправление: микрофон realtekrt5651co работает только с 48kHz stereo
-    // Принудительно используем 48kHz для захвата микрофона независимо от pcm_config_in
     struct pcm_config capture_config = pcm_config_in;
-    capture_config.rate = 48000;      // Микрофон требует 48kHz
-    capture_config.channels = 2;      // Стерео (как проверено через tinycap)
-    capture_config.period_size = 240; // 240 frames = 5ms при 48kHz (аналогично 120 при 8kHz)
-    ALOGE("SIMCOM voice: forcing capture config: rate=48000 channels=2 period=%u",
-          capture_config.period_size);
+    capture_config.rate = SIMCOM_MODEM_RATE;
+    capture_config.channels = SIMCOM_MODEM_CHANNELS;
+    capture_config.period_size = SIMCOM_MODEM_PERIOD_SAMPLES;
+    capture_config.period_count = 4;
+
+    bool capture_direct_8k = true;
+    ALOGE("SIMCOM voice: trying capture config: rate=%u channels=%u period=%u",
+          capture_config.rate, capture_config.channels, capture_config.period_size);
 
     const int device_candidates[] = {mic_device, 0, 1};
     struct pcm *pcm = NULL;
@@ -1009,6 +1476,42 @@ static int simcom_voice_start_capture(struct audio_device *adev)
     }
 
     if (!pcm) {
+        capture_direct_8k = false;
+        capture_config = pcm_config_in;
+        capture_config.rate = 48000;
+        capture_config.channels = 2;
+        capture_config.period_size = 240;
+        capture_config.period_count = 4;
+        ALOGE("SIMCOM voice: fallback capture config: rate=%u channels=%u period=%u",
+              capture_config.rate, capture_config.channels, capture_config.period_size);
+
+        for (size_t idx = 0; idx < ARRAY_SIZE(device_candidates); ++idx) {
+            int candidate = device_candidates[idx];
+            if (candidate < 0) {
+                continue;
+            }
+            if (idx > 0 && candidate == final_device) {
+                continue;
+            }
+
+            pcm = pcm_open(mic_card, candidate, PCM_IN, &capture_config);
+            if (pcm && pcm_is_ready(pcm)) {
+                final_device = candidate;
+                break;
+            }
+
+            ALOGE("SIMCOM voice: fallback pcm_open failed for capture (card=%d device=%d): %s",
+                  mic_card,
+                  candidate,
+                  pcm ? pcm_get_error(pcm) : "no handle");
+            if (pcm) {
+                pcm_close(pcm);
+                pcm = NULL;
+            }
+        }
+    }
+
+    if (!pcm) {
         route_pcm_close(CAPTURE_OFF_ROUTE);
         adev->simcom_mic_route_active = false;
         return -EIO;
@@ -1019,6 +1522,7 @@ static int simcom_voice_start_capture(struct audio_device *adev)
     adev->simcom_voice_rate = (capture_config.rate > 0) ? capture_config.rate : 8000;
     adev->simcom_voice_channels = (capture_config.channels > 0) ? capture_config.channels : 1;
     adev->simcom_voice_period_size = capture_config.period_size;
+    adev->simcom_capture_direct_8k = capture_direct_8k;
 
     ALOGE("SIMCOM voice: capture pcm_open success (card=%d device=%d rate=%u channels=%u period=%u count=%u)",
           mic_card, final_device, adev->simcom_voice_rate, adev->simcom_voice_channels,
@@ -1114,15 +1618,48 @@ static void simcom_voice_start_usecase(struct audio_device *adev)
     adev->simcom_mixer_configured = false;
     adev->simcom_mixer_card = -1;
     adev->simcom_voice_active = true;
+    adev->simcom_direct_path_ready = false;
     ALOGE("SIMCOM voice: usecase started");
     ALOGE("SIMCOM ROUTING STATUS: mic_route_active=%d, voice_active=%d, thread_started=%d",
           adev->simcom_mic_route_active, adev->simcom_voice_active, adev->simcom_voice_thread_started);
+
+    if (adev->simcom_direct_mode_enabled) {
+        int modem_ret = simcom_open_modem_pcm(adev);
+        if (modem_ret != 0) {
+            ALOGE("SIMCOM voice: modem PCM open failed (%d), fallback to AudioFlinger uplink path", modem_ret);
+            simcom_close_modem_pcm(adev);
+        }
+    }
+
+    if (simcom_open_downlink_pcm(adev) != 0 || simcom_open_speaker_pcm(adev) != 0) {
+        simcom_close_downlink_pcm(adev);
+        simcom_close_speaker_pcm(adev);
+    } else {
+        adev->simcom_downlink_thread_stop = false;
+        if (pthread_create(&adev->simcom_downlink_thread, NULL,
+                           simcom_downlink_thread, adev) == 0) {
+            adev->simcom_downlink_thread_started = true;
+        } else {
+            ALOGE("SIMCOM downlink: failed to create playback thread");
+            adev->simcom_downlink_thread_stop = true;
+            simcom_close_downlink_pcm(adev);
+            simcom_close_speaker_pcm(adev);
+        }
+    }
 
     int start_status = simcom_voice_start_capture(adev);
     if (start_status != 0) {
         ALOGE("SIMCOM voice: failed to start capture path (%d)", start_status);
         adev->simcom_voice_active = false;
         simcom_voice_stop_capture(adev);
+        adev->simcom_downlink_thread_stop = true;
+        if (adev->simcom_downlink_thread_started) {
+            pthread_join(adev->simcom_downlink_thread, NULL);
+            adev->simcom_downlink_thread_started = false;
+        }
+        simcom_close_downlink_pcm(adev);
+        simcom_close_speaker_pcm(adev);
+        simcom_close_modem_pcm(adev);
         return;
     }
 
@@ -1161,6 +1698,14 @@ static void simcom_voice_stop_usecase(struct audio_device *adev)
     adev->simcom_cpcmreg_state = false;
 
     simcom_voice_stop_capture(adev);
+    adev->simcom_downlink_thread_stop = true;
+    if (adev->simcom_downlink_thread_started) {
+        pthread_join(adev->simcom_downlink_thread, NULL);
+        adev->simcom_downlink_thread_started = false;
+    }
+    simcom_close_downlink_pcm(adev);
+    simcom_close_speaker_pcm(adev);
+    simcom_close_modem_pcm(adev);
 
     struct listnode *node, *tmp;
     list_for_each_safe(node, tmp, &adev->usecase_list) {
@@ -1989,6 +2534,9 @@ static int start_output_stream(struct stream_out *out)
     int device = 0;
     // set defualt value to true for compatible with mid project
     bool disable = true;
+    bool skip_simcom_bt_pcm =
+            (adev->simcom_direct_mode_enabled && adev->simcom_direct_path_ready) ||
+            adev->simcom_downlink_thread_started;
     
     ALOGE("start_output_stream: mode=%d, device=0x%x", adev->mode, out->device);
 
@@ -2134,6 +2682,7 @@ if (!hasExtCodec()){
 
     }
     
+	if (!skip_simcom_bt_pcm) {
 	// For voice calls, also duplicate to SIMCOM if available and not already opened
 	// This works for ANY device type during voice calls
 	// Check if the BT card is SIMCOM by reading /proc/asound/cardX/id
@@ -2259,6 +2808,8 @@ if (!hasExtCodec()){
 			ALOGE("SIMCOM already owned by another stream (owner=%p, current out=%p), skipping open", 
 			      adev->owner[SOUND_CARD_BT], out);
 		}
+    } else if (simcom_debug_audio_enabled()) {
+        ALOGE("SIMCOM: direct uplink active, skip AudioFlinger-driven SIMCOM PCM open");
     }
 
     if (out->device & AUDIO_DEVICE_OUT_SPDIF) {
@@ -2285,7 +2836,7 @@ if (!hasExtCodec()){
             }
         }
     }
-		if (out->device & AUDIO_DEVICE_OUT_ALL_SCO) {
+		if (!skip_simcom_bt_pcm && (out->device & AUDIO_DEVICE_OUT_ALL_SCO)) {
 	#ifdef BT_AP_SCO // HARD CODE FIXME
 			card = adev->dev_out[SND_OUT_SOUND_CARD_BT].card;
 			device = adev->dev_out[SND_OUT_SOUND_CARD_BT].device;
@@ -3654,6 +4205,12 @@ if (!hasExtCodec()){
         ret = -1;
         for (i = 0; i < SND_OUT_SOUND_CARD_MAX; i++)
             if (out->pcm[i]) {
+                if (i == SND_OUT_SOUND_CARD_BT &&
+                        adev->simcom_direct_mode_enabled &&
+                        adev->simcom_direct_path_ready) {
+                    // Direct SIMCOM uplink is active, skip legacy AudioFlinger-driven path
+                    continue;
+                }
                 if (i == SND_OUT_SOUND_CARD_BT) {
                     // Check if this is SIMCOM - read card ID to determine
                     int bt_card = adev->dev_out[SND_OUT_SOUND_CARD_BT].card;
@@ -5857,6 +6414,12 @@ static int adev_close(hw_device_t *device)
     adev->simcom_voice_pcm = NULL;
     adev->simcom_voice_thread_started = false;
     adev->simcom_voice_thread_stop = false;
+    adev->simcom_modem_pcm = NULL;
+    adev->simcom_direct_mode_enabled = property_get_bool("persist.vendor.simcom.direct_uplink", true);
+    adev->simcom_direct_path_ready = false;
+    simcom_reset_uplink_accumulator(adev);
+    adev->simcom_silence_recoveries = 0;
+    adev->simcom_last_silence_recover_ms = 0;
     adev->simcom_cpcmreg_state = false;
     adev->simcom_voice_rate = 0;
     adev->simcom_voice_channels = 0;
@@ -5893,6 +6456,19 @@ static void adev_open_init(struct audio_device *adev)
     adev->simcom_voice_pcm = NULL;
     adev->simcom_voice_thread_started = false;
     adev->simcom_voice_thread_stop = false;
+    adev->simcom_modem_pcm = NULL;
+    adev->simcom_downlink_pcm = NULL;
+    adev->simcom_speaker_pcm = NULL;
+    adev->simcom_downlink_thread_started = false;
+    adev->simcom_downlink_thread_stop = false;
+    adev->simcom_speaker_needs_resample = false;
+    adev->simcom_speaker_rate = SIMCOM_MODEM_RATE;
+    adev->simcom_speaker_channels = SIMCOM_MODEM_CHANNELS;
+    adev->simcom_downlink_resample_buf = NULL;
+    adev->simcom_downlink_resample_capacity = 0;
+    adev->simcom_downlink_resample_pos = 0.0;
+    adev->simcom_capture_direct_8k = false;
+    adev->simcom_direct_mode_enabled = property_get_bool("persist.vendor.simcom.direct_uplink", true);
 
     for(i =0; i < OUTPUT_TOTAL; i++){
         adev->outputs[i] = NULL;
