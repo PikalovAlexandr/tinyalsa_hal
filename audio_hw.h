@@ -48,7 +48,6 @@
 #include <string.h>
 
 #include <cutils/log.h>
-#include <cutils/list.h>
 #include <cutils/properties.h>
 #include <cutils/str_parms.h>
 
@@ -110,6 +109,17 @@
 #define HW_PARAMS_FLAG_LPCM 0
 #define HW_PARAMS_FLAG_NLPCM 1
 
+#define SIMCOM_WAIT_STEP_MS          50
+#define SIMCOM_RX_TIMEOUT_MS         12000
+#define SIMCOM_TX_TIMEOUT_MS         5000
+#define SIMCOM_RX_READ_RETRY_US      20000
+#define SIMCOM_RX_READ_MAX_RETRIES   50
+
+#define SIMCOM_PCM_RATE              8000
+#define SIMCOM_PCM_CHANNELS          1
+#define SIMCOM_PCM_BITS              16
+#define SIMCOM_RX_BUS_MAX_BYTES      (SIMCOM_PCM_RATE * SIMCOM_PCM_CHANNELS * (SIMCOM_PCM_BITS / 8))
+
 #ifdef BOX_HAL
 struct pcm_config pcm_config = {
     .channels = 2,
@@ -142,8 +152,7 @@ struct pcm_config pcm_config_in = {
     .period_count = 4,
     .format = PCM_FORMAT_S16_LE,
 };
-#endif
-#if !defined RK3399_LAPTOP
+#else
 struct pcm_config pcm_config = {
     .channels = 2,
     .rate = 44100,
@@ -232,32 +241,12 @@ struct pcm_config pcm_config_direct = {
     .format = PCM_FORMAT_S16_LE,
 };
 
-#define SIMCOM_MODEM_RATE            8000
-#define SIMCOM_MODEM_CHANNELS        1
-#define SIMCOM_MODEM_PERIOD_SAMPLES  320
-#define SIMCOM_MODEM_PERIOD_BYTES    (SIMCOM_MODEM_PERIOD_SAMPLES * sizeof(int16_t))
-
-struct pcm_config pcm_config_simcom = {
-    .channels = SIMCOM_MODEM_CHANNELS,
-    .rate = SIMCOM_MODEM_RATE,
-    .period_size = SIMCOM_MODEM_PERIOD_SAMPLES,     /* 640 bytes = 320 samples at 16-bit mono */
-    .period_count = 4,
-    .format = PCM_FORMAT_S16_LE,
-};
-
-struct pcm_config pcm_config_in_simcom = {
-    .channels = 1,
-    .rate = 8000,
-    .period_size = 800,     /* 1600 bytes = 800 samples at 16-bit mono */
-    .period_count = 4,
-    .format = PCM_FORMAT_S16_LE,
-};
-
 enum output_type {
     OUTPUT_DEEP_BUF,      // deep PCM buffers output stream
     OUTPUT_LOW_LATENCY,   // low latency output stream
-    OUTPUT_HDMI_MULTI,          // HDMI multi channel
+    OUTPUT_HDMI_MULTI,    // HDMI multi channel
     OUTPUT_DIRECT,
+    OUTPUT_SIMCOM_VOICE,  // dedicated SIMCOM telephony stream
     OUTPUT_TOTAL
 };
 
@@ -272,6 +261,7 @@ enum snd_out_sound_cards {
     SND_OUT_SOUND_CARD_HDMI,
     SND_OUT_SOUND_CARD_SPDIF,
     SND_OUT_SOUND_CARD_BT,
+    SND_OUT_SOUND_CARD_SIMCOM,
     SND_OUT_SOUND_CARD_MAX,
 };
 
@@ -280,6 +270,7 @@ enum snd_in_sound_cards {
     SND_IN_SOUND_CARD_MIC = 0,
     SND_IN_SOUND_CARD_BT,
     SND_IN_SOUND_CARD_HDMI,
+    SND_IN_SOUND_CARD_SIMCOM,
     SND_IN_SOUND_CARD_MAX,
 };
 
@@ -296,47 +287,15 @@ struct dev_info
     int device;
 };
 
-struct stream_in;
-struct stream_out;
-
-typedef enum usecase_type_t {
-    USECASE_TYPE_INVALID = -1,
-    USECASE_TYPE_PCM_PLAYBACK = 0,
-    USECASE_TYPE_PCM_CAPTURE,
-    USECASE_TYPE_VOICE_CALL,
-    USECASE_TYPE_MAX
-} usecase_type_t;
-
-typedef enum audio_usecase_t {
-    USECASE_INVALID = -1,
-    USECASE_PRIMARY_PLAYBACK = 0,
-    USECASE_PRIMARY_CAPTURE,
-    USECASE_SIMCOM_VOICE_CALL,
-    USECASE_MAX
-} audio_usecase_t;
-
-union stream_ptr {
-    struct stream_in *in;
-    struct stream_out *out;
-};
-
-struct audio_usecase {
-    struct listnode list;
-    audio_usecase_t id;
-    usecase_type_t type;
-    audio_devices_t devices;
-    union stream_ptr stream;
-};
-
-struct simcom_capture_stats {
-    uint64_t total_samples;
-    uint64_t sum_abs;
-    int32_t max_abs;
-    uint32_t call_count;
-    uint32_t zero_batches;
-    uint32_t nonzero_batches;
-    uint32_t consecutive_zero;
-    bool final_reported;
+struct simcom_rx_bus {
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    bool frame_ready;
+    bool producer_active;
+    size_t frame_bytes;
+    uint32_t frame_gen;
+    uint32_t pending_consumers;
+    uint8_t frame_buf[SIMCOM_RX_BUS_MAX_BYTES];
 };
 
 struct audio_device {
@@ -366,56 +325,21 @@ struct audio_device {
      * as pcm format and not allow to write pcm datas to HDMI/SPDIF sound cards when open it
      * with config.flag = 1.
      */
-    int*  owner[3];  /* HDMI, SPDIF, BT/SIMCOM */
+    int*  owner[2];
 
     struct dev_info dev_out[SND_OUT_SOUND_CARD_MAX];
     struct dev_info dev_in[SND_IN_SOUND_CARD_MAX];
 
-    struct listnode usecase_list;
-
-    bool simcom_mic_route_active;
-    pthread_mutex_t simcom_mic_lock;
-    pthread_cond_t simcom_mic_cond;  // Condition variable для синхронизации capture и uplink потоков
-    int16_t *simcom_mic_ring;
-    size_t simcom_mic_ring_size;
-    size_t simcom_mic_ring_read;
-    size_t simcom_mic_ring_write;
-    bool simcom_mic_ring_full;
-    bool simcom_voice_active;
-    struct pcm *simcom_voice_pcm;
-    pthread_t simcom_voice_thread;
-    bool simcom_voice_thread_started;
-    bool simcom_voice_thread_stop;
-    uint32_t simcom_voice_rate;
-    uint32_t simcom_voice_channels;
-    size_t simcom_voice_period_size;
-    bool simcom_mixer_configured;
-    int simcom_mixer_card;
-    bool simcom_cpcmreg_state;
-    struct pcm *simcom_modem_pcm;
-    struct pcm *simcom_downlink_pcm;
-    struct pcm *simcom_speaker_pcm;
-    bool simcom_direct_mode_enabled;
-    bool simcom_direct_path_ready;
-    bool simcom_capture_direct_8k;
-    bool simcom_downlink_thread_started;
-    bool simcom_downlink_thread_stop;
-    pthread_t simcom_downlink_thread;
-    bool simcom_speaker_needs_resample;
-    uint32_t simcom_speaker_rate;
-    uint32_t simcom_speaker_channels;
-    double simcom_downlink_resample_pos;
-    int16_t *simcom_downlink_resample_buf;
-    size_t simcom_downlink_resample_capacity;
-    size_t simcom_uplink_accum_used;
-    int16_t simcom_uplink_accum[SIMCOM_MODEM_PERIOD_SAMPLES];
-    struct simcom_capture_stats simcom_stats;
-    uint32_t simcom_capture_batches;
-    uint32_t simcom_capture_zero_batches;
-    uint32_t simcom_capture_nonzero_batches;
-    uint32_t simcom_capture_consecutive_zero;
-    uint32_t simcom_silence_recoveries;
-    uint64_t simcom_last_silence_recover_ms;
+    /* SIMCOM voice call support */
+    bool voice_call_active;
+    bool simcom_card_available;
+    int  simcom_pcm_card;
+    int  simcom_pcm_device;
+    struct pcm *simcom_tx_pcm;
+    struct pcm *simcom_rx_pcm;
+    int simcom_tx_users;
+    int simcom_rx_users;
+    struct simcom_rx_bus simcom_rx_bus;
 };
 
 struct stream_out {
@@ -453,8 +377,6 @@ struct stream_out {
      * others: bitstream
      */
     int output_direct_mode;
-    audio_usecase_t usecase;
-    usecase_type_t usecase_type;
     struct audio_device *dev;
     struct resampler_itfe *resampler;
     // for hdmi bitstream
@@ -464,11 +386,9 @@ struct stream_out {
     struct hdmi_audio_infors hdmi_audio;
 
     bool   snd_reopen;
-    /* SIMCOM buffer accumulation: accumulate data until full period (640 bytes) */
-    int16_t *simcom_buffer;
-    size_t simcom_buffer_used;
-    bool simcom_pcm_started;  /* Track if PCM has been started for SIMCOM */
-    int simcom_periods_written;  /* Count of periods written before starting PCM */
+    bool   is_simcom_voice;
+    bool   bypass_pcm;
+    bool   simcom_attached;
 };
 
 struct stream_in {
@@ -493,17 +413,6 @@ struct stream_in {
     audio_channel_mask_t channel_mask;
     audio_input_flags_t flags;
     struct pcm_config *config;
-    bool simcom_input;
-    bool simcom_voice_capture;
-    int16_t *simcom_mono_buf;
-    size_t simcom_mono_capacity;
-    int16_t *simcom_downsample_buf;
-    size_t simcom_downsample_capacity;
-    double simcom_resample_pos;
-    uint32_t simcom_last_rate;
-    uint32_t simcom_last_channels;
-    audio_usecase_t usecase;
-    usecase_type_t usecase_type;
 
     struct audio_device *dev;
     audio_channel_mask_t supported_channel_masks[MAX_SUPPORTED_CHANNEL_MASKS + 1];
@@ -513,6 +422,10 @@ struct stream_in {
     int mSpeexFrameSize;
     int16_t *mSpeexPcmIn;
 #endif
+    bool is_simcom_voice;
+    bool bypass_pcm;
+    bool simcom_attached;
+    uint32_t simcom_rx_last_gen;
 };
 
 #define STRING_TO_ENUM(string) { #string, string }
