@@ -389,6 +389,12 @@ struct stream_out {
     bool   is_simcom_voice;
     bool   bypass_pcm;
     bool   simcom_attached;
+
+    uint32_t requested_rate;
+    struct resampler_itfe *simcom_resampler;
+    uint32_t simcom_resampler_in_rate;
+    int16_t *simcom_resampler_buffer;
+    size_t simcom_resampler_buffer_frames;
 };
 
 struct stream_in {
@@ -426,6 +432,9 @@ struct stream_in {
     bool bypass_pcm;
     bool simcom_attached;
     uint32_t simcom_rx_last_gen;
+    struct resampler_itfe *simcom_resampler;
+    int16_t *simcom_resampler_buffer;
+    size_t simcom_resampler_buffer_size;
 };
 
 #define STRING_TO_ENUM(string) { #string, string }

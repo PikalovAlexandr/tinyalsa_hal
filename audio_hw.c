@@ -60,6 +60,12 @@
 #define OUT_SIMCOM_PCM(out)  ((out)->dev->simcom_tx_pcm)
 #define IN_SIMCOM_PCM(in)    ((in)->dev->simcom_rx_pcm)
 
+static int simcom_prepare_tx_resampler(struct stream_out *out);
+static void simcom_release_tx_resampler(struct stream_out *out);
+static int simcom_ensure_tx_resampler_buffer(struct stream_out *out,
+                                             size_t frames,
+                                             size_t channels);
+
 static bool simcom_force_patch_enabled(void)
 {
     return property_get_bool("persist.vendor.audio.simcom.force_patch", false);
@@ -371,6 +377,99 @@ static void simcom_release_rx_pcm(struct audio_device *adev)
             ALOGD("SIMCOM: telephony RX PCM still in use (%d)", adev->simcom_rx_users);
         }
     }
+}
+
+static void simcom_release_tx_resampler(struct stream_out *out)
+{
+    if (!out) {
+        return;
+    }
+    if (out->simcom_resampler) {
+        release_resampler(out->simcom_resampler);
+        out->simcom_resampler = NULL;
+    }
+    if (out->simcom_resampler_buffer) {
+        free(out->simcom_resampler_buffer);
+        out->simcom_resampler_buffer = NULL;
+        out->simcom_resampler_buffer_frames = 0;
+    }
+    out->simcom_resampler_in_rate = 0;
+}
+
+static int simcom_ensure_tx_resampler_buffer(struct stream_out *out,
+                                             size_t frames,
+                                             size_t channels)
+{
+    if (!out || channels == 0) {
+        return -EINVAL;
+    }
+    if (frames <= out->simcom_resampler_buffer_frames &&
+            out->simcom_resampler_buffer != NULL) {
+        return 0;
+    }
+
+    size_t new_frames = frames;
+    if (new_frames < out->simcom_resampler_buffer_frames * 2) {
+        new_frames = out->simcom_resampler_buffer_frames * 2;
+    }
+    if (new_frames == 0) {
+        new_frames = frames;
+    }
+
+    size_t bytes = new_frames * channels * sizeof(int16_t);
+    int16_t *buf = (int16_t *)realloc(out->simcom_resampler_buffer, bytes);
+    if (buf == NULL) {
+        ALOGE("SIMCOM: unable to allocate TX resampler buffer (%zu frames)", new_frames);
+        return -ENOMEM;
+    }
+    out->simcom_resampler_buffer = buf;
+    out->simcom_resampler_buffer_frames = new_frames;
+    return 0;
+}
+
+static int simcom_prepare_tx_resampler(struct stream_out *out)
+{
+    if (!out || !out->is_simcom_voice) {
+        simcom_release_tx_resampler(out);
+        return 0;
+    }
+
+    uint32_t requested = out->requested_rate;
+    if (requested == 0) {
+        requested = out->config.rate;
+    }
+    if (requested == out->config.rate) {
+        simcom_release_tx_resampler(out);
+        return 0;
+    }
+
+    if (out->simcom_resampler &&
+            out->simcom_resampler_in_rate == requested) {
+        return 0;
+    }
+
+    simcom_release_tx_resampler(out);
+
+    size_t channels = out->config.channels;
+    if (channels == 0) {
+        channels = 1;
+    }
+
+    int ret = create_resampler(requested,
+                               out->config.rate,
+                               channels,
+                               RESAMPLER_QUALITY_DEFAULT,
+                               NULL,
+                               &out->simcom_resampler);
+    if (ret != 0) {
+        ALOGE("SIMCOM: failed to create TX resampler %u->%u (ret=%d)",
+              requested, out->config.rate, ret);
+        simcom_release_tx_resampler(out);
+        return -EINVAL;
+    }
+
+    out->simcom_resampler_in_rate = requested;
+    return 0;
 }
 
 struct SurroundFormat {
@@ -1384,6 +1483,13 @@ if (!hasExtCodec()){
             out->simcom_attached = true;
             ALOGI("SIMCOM: telephony TX PCM attached (pcm=%p users=%d)",
                   OUT_SIMCOM_PCM(out), adev->simcom_tx_users);
+            ret = simcom_prepare_tx_resampler(out);
+            if (ret != 0) {
+                ALOGE("SIMCOM: failed to prepare TX resampler (ret=%d)", ret);
+                simcom_release_tx_pcm(adev);
+                out->simcom_attached = false;
+                return ret;
+            }
             return 0;
         }
         if (ret == -EAGAIN) {
@@ -2068,6 +2174,7 @@ static void do_out_standby(struct stream_out *out)
             simcom_release_tx_pcm(adev);
             out->simcom_attached = false;
         }
+        simcom_release_tx_resampler(out);
         for (i = 0; i < SND_OUT_SOUND_CARD_MAX; i++) {
             if (out->pcm[i]) {
                 pcm_close(out->pcm[i]);
@@ -2797,11 +2904,19 @@ if (!hasExtCodec()){
         if (out->is_simcom_voice) {
             if (!out->simcom_attached || !OUT_SIMCOM_PCM(out)) {
                 pthread_mutex_lock(&adev->lock);
-                int attach_ret = simcom_acquire_tx_pcm(adev, false);
+                int attach_ret = simcom_acquire_tx_pcm(adev, true);
                 if (attach_ret == 0) {
                     out->simcom_attached = true;
                     ALOGI("SIMCOM: out_write re-attached TX PCM (pcm=%p users=%d)",
                           OUT_SIMCOM_PCM(out), adev->simcom_tx_users);
+                    int prep_ret = simcom_prepare_tx_resampler(out);
+                    if (prep_ret != 0) {
+                        ALOGE("SIMCOM: failed to prepare TX resampler after reattach (ret=%d)",
+                              prep_ret);
+                        simcom_release_tx_pcm(adev);
+                        out->simcom_attached = false;
+                        attach_ret = prep_ret;
+                    }
                 }
                 pthread_mutex_unlock(&adev->lock);
                 if (attach_ret != 0 || !OUT_SIMCOM_PCM(out)) {
@@ -2811,17 +2926,157 @@ if (!hasExtCodec()){
                 }
             }
 
-            if (buffer && bytes > 0) {
-                simcom_log_pcm_snapshot("TX->modem", buffer, bytes);
+            const void *write_buffer = buffer;
+            size_t write_bytes = bytes;
+            if (out->simcom_resampler && buffer && bytes > 0) {
+                size_t channels = out->config.channels;
+                if (channels == 0) {
+                    channels = 1;
+                }
+                size_t in_frames = bytes / (channels * sizeof(int16_t));
+                uint32_t in_rate = out->simcom_resampler_in_rate != 0 ?
+                        out->simcom_resampler_in_rate : out->requested_rate;
+                if (in_rate == 0) {
+                    in_rate = out->config.rate;
+                }
+                size_t out_frames = (size_t)(((uint64_t)in_frames * out->config.rate) /
+                        in_rate);
+                if (out_frames == 0) {
+                    out_frames = 1;
+                }
+                if (simcom_ensure_tx_resampler_buffer(out, out_frames, channels) != 0) {
+                    ALOGE("SIMCOM: unable to allocate resampler buffer, dropping %zu bytes", bytes);
+                    ret = 0;
+                    goto exit;
+                }
+                size_t tmp_in = in_frames;
+                size_t tmp_out = out_frames;
+                out->simcom_resampler->resample_from_input(out->simcom_resampler,
+                                                           (const int16_t *)buffer,
+                                                           &tmp_in,
+                                                           out->simcom_resampler_buffer,
+                                                           &tmp_out);
+                write_buffer = out->simcom_resampler_buffer;
+                write_bytes = tmp_out * channels * sizeof(int16_t);
+                ALOGD("SIMCOM: TX resampler %u->%u inFrames=%zu outFrames=%zu",
+                      in_rate, out->config.rate, tmp_in, tmp_out);
             }
-            ALOGV("SIMCOM: out_write telephony pcm=%p bytes=%zu", OUT_SIMCOM_PCM(out), bytes);
-            ret = pcm_write(OUT_SIMCOM_PCM(out), (void *)buffer, bytes);
+            if (write_buffer && write_bytes > 0) {
+                simcom_log_pcm_snapshot("TX->modem", write_buffer, write_bytes);
+            }
+            ALOGV("SIMCOM: out_write telephony pcm=%p bytes=%zu", OUT_SIMCOM_PCM(out), write_bytes);
+            ret = pcm_write(OUT_SIMCOM_PCM(out), (void *)write_buffer, write_bytes);
             if (ret) {
                 ALOGE("SIMCOM: out_write pcm_write failed ret=%d err=%s",
                       ret, pcm_get_error(OUT_SIMCOM_PCM(out)));
             }
             goto exit;
         }
+
+        // SIMCOM: If voice call is active and primary output is used in patch,
+        // convert microphone data (48000 Hz, 2 channels) to SIMCOM format (8000 Hz, mono)
+        if (simcom_voice_mode_active(adev) && !out->is_simcom_voice && out->requested_rate > 0) {
+            // Log input buffer before conversion to diagnose zero data issue
+            if (buffer && bytes > 0) {
+                simcom_log_pcm_snapshot("TX->primary (before conversion)", buffer, bytes);
+            }
+            
+            // Ensure SIMCOM TX PCM is open
+            if (adev->simcom_tx_pcm == NULL) {
+                pthread_mutex_lock(&adev->lock);
+                int attach_ret = simcom_acquire_tx_pcm(adev, true);
+                pthread_mutex_unlock(&adev->lock);
+                if (attach_ret != 0) {
+                    ALOGW("SIMCOM: TX PCM not ready for conversion (ret=%d), skipping", attach_ret);
+                }
+            }
+            
+            if (adev->simcom_tx_pcm != NULL) {
+            // Check if this is microphone data that needs conversion
+            uint32_t in_rate = out->requested_rate;
+            uint32_t out_rate = 8000;
+            size_t in_channels = audio_channel_count_from_out_mask(out->channel_mask);
+            size_t out_channels = 1; // mono for SIMCOM
+            
+            ALOGD("SIMCOM: conversion check: in_rate=%u out_rate=%u in_channels=%zu out_channels=%zu bytes=%zu",
+                  in_rate, out_rate, in_channels, out_channels, bytes);
+            
+            if (in_rate != out_rate || in_channels != out_channels) {
+                // Need to convert: prepare resampler if not already done
+                if (!out->simcom_resampler) {
+                    ALOGI("SIMCOM: Preparing TX resampler for primary output in patch mode: %u Hz %zu ch -> %u Hz %zu ch",
+                          in_rate, in_channels, out_rate, out_channels);
+                    int ret = create_resampler(in_rate, out_rate, in_channels,
+                                               RESAMPLER_QUALITY_DEFAULT,
+                                               NULL, &out->simcom_resampler);
+                    if (ret == 0) {
+                        out->simcom_resampler_in_rate = in_rate;
+                        ALOGI("SIMCOM: TX resampler created for primary output");
+                    } else {
+                        ALOGE("SIMCOM: Failed to create TX resampler for primary output: %d", ret);
+                    }
+                }
+                
+                // Convert data if resampler is available
+                if (out->simcom_resampler && buffer && bytes > 0) {
+                    size_t in_frames = bytes / (in_channels * sizeof(int16_t));
+                    size_t out_frames = (size_t)(((uint64_t)in_frames * out_rate) / in_rate);
+                    if (out_frames == 0) {
+                        out_frames = 1;
+                    }
+                    
+                    // Allocate buffer for resampled stereo data
+                    if (simcom_ensure_tx_resampler_buffer(out, out_frames, in_channels) == 0) {
+                        size_t tmp_in = in_frames;
+                        size_t tmp_out = out_frames;
+                        out->simcom_resampler->resample_from_input(out->simcom_resampler,
+                                                                   (const int16_t *)buffer,
+                                                                   &tmp_in,
+                                                                   out->simcom_resampler_buffer,
+                                                                   &tmp_out);
+                        
+                        // Convert stereo to mono if needed
+                        int16_t *mono_buffer = NULL;
+                        size_t mono_bytes = 0;
+                        if (in_channels == 2 && out_channels == 1 && tmp_out > 0) {
+                            // Allocate temporary buffer for mono conversion
+                            mono_bytes = tmp_out * out_channels * sizeof(int16_t);
+                            mono_buffer = (int16_t *)malloc(mono_bytes);
+                            if (mono_buffer != NULL) {
+                                int16_t *stereo_data = (int16_t *)out->simcom_resampler_buffer;
+                                for (size_t i = 0; i < tmp_out; i++) {
+                                    // Average left and right channels
+                                    int32_t sum = (int32_t)stereo_data[i * 2] + (int32_t)stereo_data[i * 2 + 1];
+                                    mono_buffer[i] = (int16_t)(sum / 2);
+                                }
+                            } else {
+                                ALOGE("SIMCOM: Failed to allocate mono conversion buffer");
+                                ret = 0; // Drop this data
+                                goto exit;
+                            }
+                        }
+                        
+                        // Write converted data to SIMCOM TX PCM
+                        const void *write_buffer = (mono_buffer != NULL) ? mono_buffer : out->simcom_resampler_buffer;
+                        size_t write_bytes = (mono_buffer != NULL) ? mono_bytes : (tmp_out * in_channels * sizeof(int16_t));
+                        simcom_log_pcm_snapshot("TX->modem (converted)", write_buffer, write_bytes);
+                        ret = pcm_write(adev->simcom_tx_pcm, write_buffer, write_bytes);
+                        if (ret) {
+                            ALOGE("SIMCOM: out_write pcm_write failed for converted data ret=%d err=%s",
+                                  ret, pcm_get_error(adev->simcom_tx_pcm));
+                        } else {
+                            ALOGD("SIMCOM: TX converted %u Hz %zu ch -> %u Hz %zu ch: %zu bytes",
+                                  in_rate, in_channels, out_rate, out_channels, write_bytes);
+                        }
+                        if (mono_buffer != NULL) {
+                            free(mono_buffer);
+                        }
+                        goto exit;
+                    }
+                }
+            }
+            } // Close if (adev->simcom_tx_pcm != NULL)
+        } // Close if (simcom_voice_mode_active...)
 
         out_mute_data(out,(void*)buffer,bytes);
         dump_out_data(buffer, bytes);
@@ -3102,6 +3357,17 @@ static void do_in_standby(struct stream_in *in)
         in->standby = true;
         route_pcm_close(CAPTURE_OFF_ROUTE);
         in->simcom_rx_last_gen = 0;
+        
+        // Release SIMCOM resampler if allocated
+        if (in->simcom_resampler) {
+            release_resampler(in->simcom_resampler);
+            in->simcom_resampler = NULL;
+        }
+        if (in->simcom_resampler_buffer) {
+            free(in->simcom_resampler_buffer);
+            in->simcom_resampler_buffer = NULL;
+            in->simcom_resampler_buffer_size = 0;
+        }
     }
 
 }
@@ -3436,6 +3702,131 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
     if (in->is_simcom_voice && buffer && bytes > 0) {
         simcom_log_pcm_snapshot("RX<-modem", buffer, bytes);
     }
+    
+    // SIMCOM: If voice call is active and this is a microphone input (not SIMCOM voice),
+    // convert and write data to SIMCOM TX PCM
+    if (simcom_voice_mode_active(adev) && !in->is_simcom_voice && buffer && bytes > 0 && ret == 0) {
+        // Ensure SIMCOM TX PCM is open
+        if (adev->simcom_tx_pcm == NULL) {
+            pthread_mutex_lock(&adev->lock);
+            int attach_ret = simcom_acquire_tx_pcm(adev, true);
+            pthread_mutex_unlock(&adev->lock);
+            if (attach_ret != 0) {
+                ALOGW("SIMCOM: TX PCM not ready for microphone data (ret=%d), skipping", attach_ret);
+            }
+        }
+        
+        if (adev->simcom_tx_pcm != NULL) {
+            // Log input buffer before conversion
+            simcom_log_pcm_snapshot("TX<-microphone (before conversion)", buffer, bytes);
+            
+            // Check if conversion is needed
+            uint32_t in_rate = in->config->rate;
+            uint32_t out_rate = 8000;
+            size_t in_channels = audio_channel_count_from_in_mask(in->channel_mask);
+            size_t out_channels = 1; // mono for SIMCOM
+            
+            ALOGD("SIMCOM: microphone conversion check: in_rate=%u out_rate=%u in_channels=%zu out_channels=%zu bytes=%zu",
+                  in_rate, out_rate, in_channels, out_channels, bytes);
+            
+            if (in_rate != out_rate || in_channels != out_channels) {
+                // Need to convert: prepare resampler if not already done
+                if (!in->simcom_resampler) {
+                    ALOGI("SIMCOM: Preparing TX resampler for microphone input: %u Hz %zu ch -> %u Hz %zu ch",
+                          in_rate, in_channels, out_rate, out_channels);
+                    int resampler_ret = create_resampler(in_rate, out_rate, in_channels,
+                                                          RESAMPLER_QUALITY_DEFAULT,
+                                                          NULL, &in->simcom_resampler);
+                    if (resampler_ret == 0) {
+                        ALOGI("SIMCOM: TX resampler created for microphone input");
+                    } else {
+                        ALOGE("SIMCOM: Failed to create TX resampler for microphone input: %d", resampler_ret);
+                    }
+                }
+                
+                // Convert data if resampler is available
+                if (in->simcom_resampler && buffer && bytes > 0) {
+                    size_t in_frames = bytes / (in_channels * sizeof(int16_t));
+                    size_t out_frames = (size_t)(((uint64_t)in_frames * out_rate) / in_rate);
+                    if (out_frames == 0) {
+                        out_frames = 1;
+                    }
+                    
+                    // Allocate buffer for resampled data
+                    size_t required_size = out_frames * in_channels * sizeof(int16_t);
+                    if (in->simcom_resampler_buffer == NULL || in->simcom_resampler_buffer_size < required_size) {
+                        if (in->simcom_resampler_buffer) {
+                            free(in->simcom_resampler_buffer);
+                        }
+                        in->simcom_resampler_buffer = (int16_t *)malloc(required_size);
+                        if (in->simcom_resampler_buffer == NULL) {
+                            ALOGE("SIMCOM: failed to allocate microphone resampler buffer of size %zu", required_size);
+                            in->simcom_resampler_buffer_size = 0;
+                        } else {
+                            in->simcom_resampler_buffer_size = required_size;
+                            ALOGI("SIMCOM: allocated microphone resampler buffer of size %zu", required_size);
+                        }
+                    }
+                    
+                    if (in->simcom_resampler_buffer != NULL) {
+                        size_t tmp_in = in_frames;
+                        size_t tmp_out = out_frames;
+                        in->simcom_resampler->resample_from_input(in->simcom_resampler,
+                                                                  (const int16_t *)buffer,
+                                                                  &tmp_in,
+                                                                  in->simcom_resampler_buffer,
+                                                                  &tmp_out);
+                        
+                        // Convert stereo to mono if needed
+                        int16_t *mono_buffer = NULL;
+                        size_t mono_bytes = 0;
+                        if (in_channels == 2 && out_channels == 1 && tmp_out > 0) {
+                            // Allocate temporary buffer for mono conversion
+                            mono_bytes = tmp_out * out_channels * sizeof(int16_t);
+                            mono_buffer = (int16_t *)malloc(mono_bytes);
+                            if (mono_buffer != NULL) {
+                                int16_t *stereo_data = (int16_t *)in->simcom_resampler_buffer;
+                                for (size_t i = 0; i < tmp_out; i++) {
+                                    // Average left and right channels
+                                    int32_t sum = (int32_t)stereo_data[i * 2] + (int32_t)stereo_data[i * 2 + 1];
+                                    mono_buffer[i] = (int16_t)(sum / 2);
+                                }
+                            } else {
+                                ALOGE("SIMCOM: Failed to allocate mono conversion buffer for microphone");
+                            }
+                        }
+                        
+                        // Write converted data to SIMCOM TX PCM
+                        const void *write_buffer = (mono_buffer != NULL) ? mono_buffer : in->simcom_resampler_buffer;
+                        size_t write_bytes = (mono_buffer != NULL) ? mono_bytes : (tmp_out * in_channels * sizeof(int16_t));
+                        simcom_log_pcm_snapshot("TX->modem (from microphone)", write_buffer, write_bytes);
+                        int write_ret = pcm_write(adev->simcom_tx_pcm, write_buffer, write_bytes);
+                        if (write_ret) {
+                            ALOGE("SIMCOM: in_read pcm_write failed for microphone data ret=%d err=%s",
+                                  write_ret, pcm_get_error(adev->simcom_tx_pcm));
+                        } else {
+                            ALOGD("SIMCOM: TX converted from microphone %u Hz %zu ch -> %u Hz %zu ch: %zu bytes",
+                                  in_rate, in_channels, out_rate, out_channels, write_bytes);
+                        }
+                        if (mono_buffer != NULL) {
+                            free(mono_buffer);
+                        }
+                    }
+                }
+            } else {
+                // No conversion needed, write directly
+                simcom_log_pcm_snapshot("TX->modem (from microphone, direct)", buffer, bytes);
+                int write_ret = pcm_write(adev->simcom_tx_pcm, buffer, bytes);
+                if (write_ret) {
+                    ALOGE("SIMCOM: in_read pcm_write failed for microphone data (direct) ret=%d err=%s",
+                          write_ret, pcm_get_error(adev->simcom_tx_pcm));
+                } else {
+                    ALOGD("SIMCOM: TX wrote microphone data directly: %zu bytes", bytes);
+                }
+            }
+        }
+    }
+    
     dump_in_data(buffer, bytes);
 
 #ifdef AUDIO_3A
@@ -3721,6 +4112,7 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
     bool telephony_tx = (devices & AUDIO_DEVICE_OUT_TELEPHONY_TX);
     bool call_mode_active = simcom_voice_mode_active(adev);
     bool force_patch = simcom_force_patch_enabled();
+    uint32_t client_requested_rate = config->sample_rate;
 
     ALOGD("audio hal adev_open_output_stream devices = 0x%x, flags = %d, samplerate = %d,format = 0x%x",
           devices, flags, config->sample_rate,config->format);
@@ -3756,6 +4148,12 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
     out->is_simcom_voice = telephony_tx;
     out->bypass_pcm = force_patch && call_mode_active && !telephony_tx;
     out->simcom_attached = false;
+    out->requested_rate = client_requested_rate != 0 ?
+            client_requested_rate : config->sample_rate;
+    out->simcom_resampler = NULL;
+    out->simcom_resampler_buffer = NULL;
+    out->simcom_resampler_buffer_frames = 0;
+    out->simcom_resampler_in_rate = 0;
 
     if (telephony_tx && force_patch) {
         ALOGI("SIMCOM: Telephony Tx requested - NO PCM in adev_open (patch mode)");
@@ -4031,6 +4429,7 @@ static void adev_close_output_stream(struct audio_hw_device *dev,
         }
 
         destory_hdmi_audio(&out->hdmi_audio);
+        simcom_release_tx_resampler(out);
     }
     pthread_mutex_unlock(&adev->lock_outputs);
     free(stream);
@@ -4267,7 +4666,10 @@ static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
           previous, mode, adev->simcom_card_available, adev->voice_call_active);
     adev->mode = mode;
 
-    if (!now_call && adev->voice_call_active) {
+    if (now_call && adev->simcom_card_available && !adev->voice_call_active) {
+        adev->voice_call_active = true;
+        ALOGI("SIMCOM: entered call mode, setting voice flag");
+    } else if (!now_call && adev->voice_call_active) {
         ALOGI("SIMCOM: exited call mode, clearing voice flag");
         adev->voice_call_active = false;
     }
